@@ -219,3 +219,5 @@ cd pokergoat-solver
 
 네트워크와 R2는 전부 목이라 자격증명 없이 돈다. claim의 204 처리, manifest 매핑,
 업로드 키 조립, 메모리 가드, 실패 경로의 `fail` 호출을 덮는다.
+
+launchd의 ProcessType은 Interactive로 둔다. Standard로 두면 macOS가 솔버 스레드를 효율 코어 쪽으로 몰아 같은 트리가 341초 걸리던 것이 Interactive에서는 123초로 끝났다(2026-09-07 실측, 잡 4와 5 비교).

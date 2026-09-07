@@ -52,7 +52,7 @@
 
     <!-- 솔브는 CPU를 오래 쓴다. 백그라운드로 눌리면 배치가 하염없이 느려진다. -->
     <key>ProcessType</key>
-    <string>Standard</string>
+    <string>Interactive</string>
     <key>LowPriorityIO</key>
     <false/>
 </dict>
