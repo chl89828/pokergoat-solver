@@ -7,7 +7,7 @@ Django API의 잡 큐를 폴링해서 하나씩 가져오고, pokergoat-solver C
 
 흐름 하나는 이렇다.
 
-    claim -> estimate(메모리 상한 검사) -> solve -> R2 업로드 -> HEAD 검증
+    claim -> estimate(메모리 상한 검사) -> solve -> R2 업로드(병렬)
           -> complete -> work 디렉토리 삭제
 
 의존성은 표준 라이브러리와 boto3, requests뿐이다. Railway CLI는 쓰지 않는다.
@@ -23,9 +23,11 @@ API 토큰과 R2 키만 있으면 돌기 때문에 마케팅 러너에서 겪은
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -62,6 +64,16 @@ VALIDATE_TIMEOUT_SEC = 600
 HTTP_TIMEOUT_SEC = 60
 
 CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+# out/ 업로드 병렬도 기본값. SOLVER_UPLOAD_WORKERS로 덮어쓴다.
+DEFAULT_UPLOAD_WORKERS = 16
+# 파일 하나가 재시도 후에도 실패로 굳기까지 시도하는 횟수.
+UPLOAD_RETRY_ATTEMPTS = 3
+# 재시도 사이 대기(초). attempt 1 실패 후 0.5s, attempt 2 실패 후 1.0s.
+UPLOAD_RETRY_BACKOFF_BASE_SEC = 0.5
+# 이 개수마다 진행 로그를 한 줄 찍는다.
+UPLOAD_LOG_EVERY = 500
+MANIFEST_FILENAME = "manifest.json"
 
 # manifest는 API에서 16KB 상한이 걸려 있는데 CLI manifest의 files와 턴 동형
 # 매핑은 그 혼자로 수십 KB다. 잡 기록에 필요한 건 요약값이라 큰 배열을 뺀다.
@@ -189,6 +201,22 @@ def sanitize_runner_id(value):
     return cleaned or "mac-runner"
 
 
+def parse_solve_args(raw):
+    """`SOLVER_SOLVE_ARGS`를 argv 조각으로 쪼갠다.
+
+    셸을 태우지 않고 shlex로만 나누므로 따옴표는 먹지만 변수 전개나 글롭은
+    일어나지 않는다. 따옴표가 안 맞으면 ValueError를 올려서 러너가 시작할 때
+    바로 걸리게 한다 (조용히 무시하면 옵션이 빠진 줄 모르고 돈다).
+    """
+    text = (raw or "").strip()
+    if not text:
+        return []
+    try:
+        return shlex.split(text)
+    except ValueError as exc:
+        raise ValueError(f"SOLVER_SOLVE_ARGS를 읽지 못했다: {exc}") from exc
+
+
 def default_threads():
     """물리 코어 수. 애플 실리콘은 하이퍼스레딩이 없어 논리 코어와 같다."""
     return os.cpu_count() or 4
@@ -214,7 +242,11 @@ class RunnerConfig:
             env.get("SOLVER_WORK_DIR") or (RUNNER_DIR / "work")
         ).expanduser()
         self.poll_interval_sec = _int_env("SOLVER_POLL_INTERVAL_SEC", 30)
+        # solve 서브커맨드 뒤에 그대로 붙는 추가 인자 (예: "--river-ev off")
+        self.solve_args = parse_solve_args(env.get("SOLVER_SOLVE_ARGS"))
         self.once = _bool_env("SOLVER_ONCE", False)
+        # out/ 업로드에 쓸 스레드 수. R2 라운드트립이 병목이라 코어 수보다 크게 잡는다.
+        self.upload_workers = _int_env("SOLVER_UPLOAD_WORKERS", DEFAULT_UPLOAD_WORKERS)
         self.r2_account_id = env.get("R2_ACCOUNT_ID") or ""
         self.r2_access_key_id = env.get("R2_ACCESS_KEY_ID") or ""
         self.r2_secret_access_key = env.get("R2_SECRET_ACCESS_KEY") or ""
@@ -251,6 +283,8 @@ class RunnerConfig:
             f"시간 상한    {self.job_time_limit_sec}s",
             f"작업 디렉토리 {self.work_dir}",
             f"폴링 간격    {self.poll_interval_sec}s",
+            f"추가 인자    {' '.join(self.solve_args) if self.solve_args else '없음'}",
+            f"업로드 워커  {self.upload_workers}",
             f"R2 버킷      {self.r2_bucket or '없음'}",
             f"R2 계정      {'설정됨' if self.r2_account_id else '없음'}",
             f"R2 키        {'설정됨' if self.r2_access_key_id else '없음'}",
@@ -370,6 +404,10 @@ def build_r2_client(config):
     options = {
         "signature_version": "s3v4",
         "retries": {"max_attempts": 5, "mode": "standard"},
+        # 워커 스레드 수만큼 동시 연결을 열 수 있어야 풀에서 대기하지 않는다.
+        # boto3 클라이언트는 스레드 세이프해서 워커 전체가 이 클라이언트
+        # 하나를 공유한다 (호출부는 Runner.r2 프로퍼티 참고).
+        "max_pool_connections": max(config.upload_workers, 10),
         # R2는 boto3 1.36부터 기본으로 붙는 flexible checksum을 다 받아주지
         # 않는다. 필요할 때만 계산하도록 낮춘다.
         "request_checksum_calculation": "when_required",
@@ -425,31 +463,110 @@ def build_key(blob_prefix, relative_path):
     return prefix + str(relative_path).replace(os.sep, "/")
 
 
-def upload_directory(client, bucket, out_dir, blob_prefix):
-    """out/의 모든 파일을 R2에 올리고 (키, 바이트) 목록을 돌려준다."""
-    uploaded = []
-    for relative, path in iter_upload_files(out_dir):
-        key = build_key(blob_prefix, relative)
-        with open(path, "rb") as handle:
-            client.put_object(
-                Bucket=bucket, Key=key, Body=handle, **upload_args_for(relative)
-            )
-        uploaded.append((key, path.stat().st_size))
-    return uploaded
+class UploadError(Exception):
+    """파일 하나가 재시도 후에도 업로드에 실패했다. key와 원인을 들고 있다."""
+
+    def __init__(self, key, cause):
+        super().__init__(f"{key}: {cause}")
+        self.key = key
+        self.cause = cause
 
 
-def verify_uploads(client, bucket, uploaded):
-    """올린 키마다 HEAD를 쳐서 존재와 크기를 확인한다."""
-    for key, size in uploaded:
+def _put_object_with_retry(client, bucket, key, path, args, attempts=UPLOAD_RETRY_ATTEMPTS):
+    """put_object를 최대 attempts번 시도한다.
+
+    botocore 예외(네트워크 끊김, 429, 5xx 등)만 재시도 대상이다. 그 외
+    예외(로컬 파일 IO 오류 등)는 재시도해도 소용이 없으니 바로 올려보낸다.
+    """
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    last_exc = None
+    for attempt in range(1, attempts + 1):
         try:
-            head = client.head_object(Bucket=bucket, Key=key)
-        except Exception as exc:
-            raise JobFailure(f"업로드 검증 실패 (HEAD {key}): {exc}") from exc
-        remote = head.get("ContentLength")
-        if remote is not None and int(remote) != int(size):
-            raise JobFailure(
-                f"업로드 크기 불일치 {key}: 로컬 {size} != 원격 {remote}"
-            )
+            with open(path, "rb") as handle:
+                return client.put_object(Bucket=bucket, Key=key, Body=handle, **args)
+        except (BotoCoreError, ClientError) as exc:
+            last_exc = exc
+            if attempt < attempts:
+                time.sleep(UPLOAD_RETRY_BACKOFF_BASE_SEC * (2 ** (attempt - 1)))
+    raise UploadError(key, last_exc)
+
+
+def upload_directory(client, bucket, out_dir, blob_prefix, workers=DEFAULT_UPLOAD_WORKERS):
+    """out/의 모든 파일을 R2에 병렬로 올리고 (키, 바이트) 목록을 돌려준다.
+
+    blob(.bin.br 등)을 ThreadPoolExecutor로 동시에 올린 뒤, 전부 성공해야만
+    manifest.json을 마지막으로 하나 더 올린다. 도중에 잡이 죽거나 파일 하나가
+    끝내 실패해도 manifest 없는 반쪽 솔루션이 CDN에 노출되지 않는다.
+
+    검증은 별도 HEAD를 치지 않는다. S3 호환 PUT은 원자적이라 put_object가
+    예외 없이 돌아오면 R2가 그 객체를 통째로 받았다는 뜻이고, 재시도도
+    botocore가 붙잡지 못한 실패만 여기서 다시 돈다. 그래서 성공 응답 자체가
+    이미 존재+크기 검증이다 (2400개 파일마다 왕복을 하나씩 더 태우던 HEAD를
+    없애는 이유). 로컬에서 이미 알고 있는 바이트 수를 그대로 반환값에 쓴다.
+    """
+    out_dir = Path(out_dir)
+    entries = iter_upload_files(out_dir)
+    manifest_entry = None
+    blob_entries = []
+    for relative, path in entries:
+        if relative == MANIFEST_FILENAME:
+            manifest_entry = (relative, path)
+        else:
+            blob_entries.append((relative, path))
+
+    uploaded = []
+    failures = []
+    started = time.monotonic()
+    done = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        future_to_entry = {
+            pool.submit(
+                _put_object_with_retry,
+                client,
+                bucket,
+                build_key(blob_prefix, relative),
+                path,
+                upload_args_for(relative),
+            ): (relative, path)
+            for relative, path in blob_entries
+        }
+        for future in concurrent.futures.as_completed(future_to_entry):
+            relative, path = future_to_entry[future]
+            key = build_key(blob_prefix, relative)
+            try:
+                future.result()
+            except UploadError as exc:
+                failures.append(exc.key)
+                continue
+            uploaded.append((key, path.stat().st_size))
+            done += 1
+            if done % UPLOAD_LOG_EVERY == 0:
+                log(f"업로드 진행 {done}/{len(blob_entries)}개 -> {blob_prefix}")
+
+    if failures:
+        shown = ", ".join(failures[:5])
+        more = f" 외 {len(failures) - 5}개" if len(failures) > 5 else ""
+        raise JobFailure(
+            f"업로드 실패 (재시도 {UPLOAD_RETRY_ATTEMPTS}회 소진, "
+            f"{len(failures)}개 파일): {shown}{more}"
+        )
+
+    if manifest_entry is not None:
+        relative, path = manifest_entry
+        key = build_key(blob_prefix, relative)
+        _put_object_with_retry(client, bucket, key, path, upload_args_for(relative))
+        uploaded.append((key, path.stat().st_size))
+
+    elapsed = max(time.monotonic() - started, 1e-9)
+    total_bytes = sum(size for _, size in uploaded)
+    mb_per_sec = (total_bytes / 1024**2) / elapsed
+    log(
+        f"업로드 완료 {len(uploaded)}개 파일 {total_bytes / 1024**2:.1f}MB "
+        f"{elapsed:.1f}s ({mb_per_sec:.1f}MB/s) -> {blob_prefix}"
+    )
+    return uploaded
 
 
 # ── CLI 실행 ────────────────────────────────────────────────────────────
@@ -528,8 +645,14 @@ def read_tail_file(path, limit=MAX_ERROR_CHARS):
     return tail(data, limit)
 
 
-def run_solve(solver_bin, config_path, out_dir, threads, time_limit, stderr_path):
-    """solve 서브프로세스. STOP이 서면 죽이고 RunnerStopped를 올린다."""
+def run_solve(
+    solver_bin, config_path, out_dir, threads, time_limit, stderr_path, extra_args=None
+):
+    """solve 서브프로세스. STOP이 서면 죽이고 RunnerStopped를 올린다.
+
+    `extra_args`(SOLVER_SOLVE_ARGS)는 맨 뒤에 붙는다. 뒤에 오는 값이 이기는
+    clap 규칙이라 러너가 세운 기본 인자를 덮어쓸 수도 있다.
+    """
     argv = [
         str(solver_bin),
         "solve",
@@ -542,7 +665,9 @@ def run_solve(solver_bin, config_path, out_dir, threads, time_limit, stderr_path
         "--time-limit",
         str(time_limit),
     ]
-    log(f"solve 실행: threads={threads} time-limit={time_limit}s out={out_dir}")
+    argv.extend(extra_args or [])
+    extra_note = f" extra={' '.join(extra_args)}" if extra_args else ""
+    log(f"solve 실행: threads={threads} time-limit={time_limit}s out={out_dir}{extra_note}")
 
     hard_deadline = time.monotonic() + time_limit + SOLVE_EXPORT_GRACE_SEC
     stdout_path = Path(stderr_path).parent / "solve.out.log"
@@ -722,6 +847,7 @@ class Runner:
                     self.config.threads,
                     self.config.job_time_limit_sec,
                     work / "solve.err.log",
+                    extra_args=self.config.solve_args,
                 )
 
             manifest_path = out_dir / "manifest.json"
@@ -730,16 +856,15 @@ class Runner:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
             uploaded = upload_directory(
-                self.r2, self.config.r2_bucket, out_dir, blob_prefix
+                self.r2,
+                self.config.r2_bucket,
+                out_dir,
+                blob_prefix,
+                workers=self.config.upload_workers,
             )
             if not uploaded:
                 raise JobFailure("업로드할 파일이 없다")
-            verify_uploads(self.r2, self.config.r2_bucket, uploaded)
             total_bytes = sum(size for _, size in uploaded)
-            log(
-                f"잡 {job_id} 업로드 {len(uploaded)}개 파일 "
-                f"{total_bytes / 1024**2:.1f}MB -> {blob_prefix}"
-            )
 
             payload = completion_payload(manifest, total_bytes)
             self.api.complete(
@@ -907,7 +1032,11 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     apply_env_file(args.env)
-    config = RunnerConfig()
+    try:
+        config = RunnerConfig()
+    except ValueError as exc:
+        log(str(exc))
+        return 1
 
     if args.check:
         return run_check(config)

@@ -17,7 +17,7 @@ claim ──204──> 폴링 간격만큼 대기
   └─200─> work/{job_id}/job.json 쓰기
           → estimate (메모리 상한 검사, 넘으면 여기서 fail)
           → solve (60초마다 heartbeat)
-          → out/ 전부 R2 업로드 → 키마다 HEAD로 검증
+          → out/ 전부 R2 병렬 업로드, manifest.json은 마지막에
           → complete (manifest, 크기, 노드 수, 익스플로이터빌리티)
           → work 디렉토리 삭제
 ```
@@ -64,6 +64,8 @@ cp .env.example .env && chmod 600 .env # 값 입력 (아래 표)
 | `SOLVER_WORK_DIR` | `runner/work` | 잡별 작업 디렉토리. 완료하면 지운다 |
 | `SOLVER_POLL_INTERVAL_SEC` | 30 | 큐가 비었을 때 쉬는 시간 |
 | `SOLVER_ONCE` | 없음 | 1이면 잡 하나만 처리하고 종료 |
+| `SOLVER_SOLVE_ARGS` | 없음 | `solve` 뒤에 그대로 붙는 추가 CLI 인자 |
+| `SOLVER_UPLOAD_WORKERS` | 16 | out/ 업로드 동시 처리 스레드 수 |
 | `R2_ACCOUNT_ID` | (필수) | 엔드포인트 `https://{id}.r2.cloudflarestorage.com` |
 | `R2_ACCESS_KEY_ID` | (필수) | R2 API 토큰 |
 | `R2_SECRET_ACCESS_KEY` | (필수) | R2 API 토큰 |
@@ -75,6 +77,50 @@ cp .env.example .env && chmod 600 .env # 값 입력 (아래 표)
 
 메모리 상한은 CLI의 `--memory auto`와 같은 규칙으로 본다. 비압축 크기가 8GiB를
 넘으면 엔진이 압축 저장으로 내려가므로 러너도 그때는 압축 크기와 비교한다.
+
+### 추가 인자 (`SOLVER_SOLVE_ARGS`)
+
+러너는 `solve --config ... --out ... --threads ... --time-limit ...`까지만 세운다.
+그 뒤에 더 붙이고 싶은 인자가 있으면 이 키에 적는다. 셸을 거치지 않고 `shlex`로만
+쪼개기 때문에 따옴표는 먹지만 `$VAR` 전개나 글롭은 일어나지 않는다. 따옴표가 안
+맞으면 러너가 시작하면서 바로 실패한다.
+
+```
+SOLVER_SOLVE_ARGS=--river-ev off --river-prune-reach 0.001
+```
+
+리버까지 저장하는 잡(`storeRiver: true`)은 출력이 수백 MB로 불어난다. 리버 노드의
+EV가 용량 대부분을 먹기 때문이다. `--river-ev off`는 리버 플레이어 노드에서 EV를
+빼고 전략만 남기고, `--river-prune-reach`는 도달 확률이 그 값 미만인 리버 노드를
+헤더만 남기고 자른다. 잡 JSON의 `riverEv`, `riverPruneReach`보다 이 인자가 우선한다.
+실제로 어떤 값으로 돌았는지는 `manifest.json`의 `riverEv`, `riverPruneReach`에 남는다.
+
+인자는 맨 뒤에 붙으므로 러너가 세운 기본값(`--threads` 등)을 덮어쓸 수도 있다.
+의도한 게 아니라면 겹치는 키는 넣지 마라.
+
+### 업로드 병렬도 (`SOLVER_UPLOAD_WORKERS`)
+
+잡 하나가 out/ 아래 2,400개 파일, 총 75MB 정도를 남긴다. 파일마다 R2 왕복이
+따로 걸리니 순차로 올리면 10분 가까이 걸린다. 러너는 이 파일들을
+`ThreadPoolExecutor`로 동시에 올려서 왕복 지연을 겹치게 만든다. boto3 클라이언트는
+스레드 세이프해서 워커 전체가 클라이언트 하나를 공유하고, 연결 풀 크기
+(`max_pool_connections`)도 워커 수에 맞춘다.
+
+파일 하나가 실패하면 최대 3회까지 지수 백오프로 재시도하고, 그래도 안 되면
+실패한 키 몇 개를 담아 잡을 실패로 돌린다. blob이 전부 끝난 뒤에야
+`manifest.json`을 마지막으로 올려서, 중간에 죽어도 manifest 없는 반쪽
+솔루션이 CDN에 노출되지 않는다.
+
+업로드가 끝났는지는 별도 HEAD 요청으로 확인하지 않는다. R2도 S3 호환이라
+PUT이 원자적이다. `put_object`가 예외 없이 돌아왔다는 것 자체가 그 객체를
+통째로 받았다는 뜻이라, HEAD 왕복 2,400번을 더 태울 이유가 없다.
+
+기본값 16은 맥 한 대에서 무난한 값이다. 회선이 넉넉하면 올려서 더 짧게
+끝낼 수 있고, R2 쪽에서 요청이 밀리면 낮춘다.
+
+```
+SOLVER_UPLOAD_WORKERS=16
+```
 
 ## Django 쪽 설정
 
@@ -159,9 +205,10 @@ plist가 `caffeinate -i`로 감싸므로 유휴 슬립은 막지만, 뚜껑을 �
 `install-bin.sh`가 `xattr -d com.apple.quarantine`을 시도하지만 막히면 시스템
 설정의 보안 항목에서 한 번 허용해 준다.
 
-**업로드 검증에서 크기가 안 맞는다.** R2에 올라간 객체의 `ContentLength`가 로컬
-파일과 다르다는 뜻이다. 같은 키를 다른 러너가 동시에 쓰고 있는지 본다. blob
-경로는 잡마다 다르므로 정상 운영에서는 겹치지 않는다.
+**업로드가 재시도 3회 후에도 실패한다.** 에러 메시지에 파일 키 몇 개가 같이
+찍힌다. R2 쪽 일시 장애나 회선 문제일 가능성이 크므로 잡은 다음 사이클에
+자동으로 재시도된다(API가 재시도 횟수를 센다). 계속 반복되면 `R2_ACCESS_KEY_ID`
+권한이나 `SOLVER_UPLOAD_WORKERS` 값을 낮춰서 동시 연결 수를 줄여본다.
 
 ## 테스트
 

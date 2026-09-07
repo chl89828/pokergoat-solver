@@ -7,10 +7,12 @@
 
 import json
 import sys
+import threading
 from pathlib import Path
 from unittest import mock
 
 import pytest
+from botocore.exceptions import ClientError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -349,21 +351,164 @@ def test_upload_directory_builds_keys_and_metadata(tmp_path):
     ]
 
 
-def test_verify_uploads_flags_size_mismatch():
+def test_upload_directory_uploads_manifest_last(tmp_path):
+    """블롭이 전부 성공한 뒤에야 manifest.json을 올린다."""
+    out = _write_out_dir(tmp_path)
+    order = []
+    lock = threading.Lock()
     client = mock.Mock()
-    client.head_object.return_value = {"ContentLength": 5}
-    with pytest.raises(R.JobFailure, match="크기 불일치"):
-        R.verify_uploads(client, "bucket", [("k", 9)])
+
+    def fake_put_object(Bucket, Key, Body, **kwargs):
+        with lock:
+            order.append(Key)
+        return {"ETag": '"abc"'}
+
+    client.put_object.side_effect = fake_put_object
+    uploaded = R.upload_directory(client, "bucket", out, JOB["blob_prefix"], workers=4)
+
+    manifest_key = "solutions/c6m_100_srp_btn_bb/As7d2c/manifest.json"
+    assert len(uploaded) == 3
+    assert order[-1] == manifest_key
+    assert order.count(manifest_key) == 1
 
 
-def test_verify_uploads_flags_missing_object():
+def test_upload_directory_retries_transient_failure_then_succeeds(tmp_path, monkeypatch):
+    """일시적 botocore 오류는 최대 3회까지 재시도해서 결국 성공한다."""
+    monkeypatch.setattr(R.time, "sleep", lambda seconds: None)
+    out = _write_out_dir(tmp_path)
     client = mock.Mock()
-    client.head_object.side_effect = RuntimeError("404")
-    with pytest.raises(R.JobFailure, match="업로드 검증 실패"):
-        R.verify_uploads(client, "bucket", [("k", 9)])
+    call_counts = {}
+    lock = threading.Lock()
+
+    def fake_put_object(Bucket, Key, Body, **kwargs):
+        with lock:
+            call_counts[Key] = call_counts.get(Key, 0) + 1
+            count = call_counts[Key]
+        if Key.endswith("flop.bin.br") and count < 3:
+            raise ClientError({"Error": {"Code": "500", "Message": "boom"}}, "PutObject")
+        return {"ETag": '"abc"'}
+
+    client.put_object.side_effect = fake_put_object
+    uploaded = R.upload_directory(client, "bucket", out, JOB["blob_prefix"], workers=4)
+
+    keys = [key for key, _ in uploaded]
+    assert "solutions/c6m_100_srp_btn_bb/As7d2c/flop.bin.br" in keys
+    assert call_counts["solutions/c6m_100_srp_btn_bb/As7d2c/flop.bin.br"] == 3
+
+
+def test_upload_directory_fails_job_after_max_retries(tmp_path, monkeypatch):
+    """3회 재시도 후에도 실패한 파일이 있으면 JobFailure로 잡을 실패시킨다."""
+    monkeypatch.setattr(R.time, "sleep", lambda seconds: None)
+    out = _write_out_dir(tmp_path)
+    client = mock.Mock()
+
+    def fake_put_object(Bucket, Key, Body, **kwargs):
+        if Key.endswith("flop.bin.br"):
+            raise ClientError({"Error": {"Code": "500", "Message": "boom"}}, "PutObject")
+        return {"ETag": '"abc"'}
+
+    client.put_object.side_effect = fake_put_object
+    with pytest.raises(R.JobFailure, match="flop.bin.br"):
+        R.upload_directory(client, "bucket", out, JOB["blob_prefix"], workers=4)
+
+    # 블롭이 실패했으니 manifest는 절대 올라가지 않는다.
+    manifest_calls = [
+        call
+        for call in client.put_object.call_args_list
+        if call.kwargs["Key"].endswith("manifest.json")
+    ]
+    assert not manifest_calls
 
 
 # ── 메모리 가드 ─────────────────────────────────────────────────────────
+
+
+def test_parse_solve_args_splits_like_a_shell():
+    assert R.parse_solve_args(None) == []
+    assert R.parse_solve_args("   ") == []
+    assert R.parse_solve_args("--river-ev off --river-prune-reach 0.001") == [
+        "--river-ev",
+        "off",
+        "--river-prune-reach",
+        "0.001",
+    ]
+    assert R.parse_solve_args('--memory "full"') == ["--memory", "full"]
+    with pytest.raises(ValueError):
+        R.parse_solve_args('--memory "full')
+
+
+def test_config_reads_solve_args_from_env():
+    env = {"SOLVER_SOLVE_ARGS": "--river-ev off"}
+    config = R.RunnerConfig(env=env)
+    assert config.solve_args == ["--river-ev", "off"]
+    assert "--river-ev off" in "\n".join(config.summary_lines())
+    assert R.RunnerConfig(env={}).solve_args == []
+
+
+def test_config_reads_upload_workers_from_env():
+    # threads/max_memory_gb 등과 같은 패턴: _int_env는 os.environ을 직접 읽으므로
+    # RunnerConfig(env=...) 생성자 인자가 아니라 프로세스 환경을 패치해야 한다.
+    assert R.RunnerConfig(env={}).upload_workers == R.DEFAULT_UPLOAD_WORKERS
+    with mock.patch.dict(R.os.environ, {"SOLVER_UPLOAD_WORKERS": "4"}, clear=False):
+        config = R.RunnerConfig()
+    assert config.upload_workers == 4
+    assert "업로드 워커  4" in "\n".join(config.summary_lines())
+
+
+def test_run_solve_appends_extra_args(tmp_path):
+    """SOLVER_SOLVE_ARGS는 solve 명령 뒤에 그대로 붙는다."""
+    captured = {}
+
+    class FakeProc:
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(argv, stdout=None, stderr=None):
+        captured["argv"] = argv
+        return FakeProc()
+
+    with mock.patch.object(R.subprocess, "Popen", side_effect=fake_popen):
+        R.run_solve(
+            "/bin/solver",
+            tmp_path / "job.json",
+            tmp_path / "out",
+            8,
+            3600,
+            tmp_path / "solve.err.log",
+            extra_args=["--river-ev", "off", "--river-prune-reach", "0.001"],
+        )
+
+    argv = captured["argv"]
+    assert argv[:2] == ["/bin/solver", "solve"]
+    assert argv[-4:] == ["--river-ev", "off", "--river-prune-reach", "0.001"]
+    assert "--time-limit" in argv
+
+    # 인자를 주지 않으면 예전과 같은 명령이다
+    with mock.patch.object(R.subprocess, "Popen", side_effect=fake_popen):
+        R.run_solve(
+            "/bin/solver",
+            tmp_path / "job.json",
+            tmp_path / "out",
+            8,
+            3600,
+            tmp_path / "solve.err.log",
+        )
+    assert captured["argv"][-1] == "3600"
+
+
+def test_handle_job_passes_solve_args(config):
+    """러너 설정의 추가 인자가 solve 호출까지 전달된다."""
+    config.solve_args = ["--river-ev", "off"]
+    api = mock.Mock()
+    runner = R.Runner(config, api=api, r2=mock.Mock())
+    estimate = {"nodeCount": 10, "memoryBytes": {"uncompressed": 1024**3}}
+
+    with mock.patch.object(R, "run_estimate", return_value=estimate), mock.patch.object(
+        R, "run_solve", side_effect=R.JobFailure("멈춤")
+    ) as solve:
+        runner.handle_job(dict(JOB))
+
+    assert solve.call_args.kwargs["extra_args"] == ["--river-ev", "off"]
 
 
 def test_check_memory_limit_passes_under_limit():
@@ -416,24 +561,18 @@ def test_handle_job_memory_guard_posts_fail_without_solving(config):
 def test_handle_job_success_uploads_and_completes(config, tmp_path):
     api = mock.Mock()
     r2 = mock.Mock()
-    r2.head_object.side_effect = lambda Bucket, Key: {
-        "ContentLength": _sizes[Key]
-    }
     runner = R.Runner(config, api=api, r2=r2)
 
     estimate = {"nodeCount": 1332, "memoryBytes": {"uncompressed": 1024**3}}
-    _sizes = {}
 
-    def fake_solve(solver_bin, config_path, out_dir, threads, time_limit, stderr_path):
+    def fake_solve(
+        solver_bin, config_path, out_dir, threads, time_limit, stderr_path, extra_args=None
+    ):
         out = Path(out_dir)
         (out / "turn").mkdir(parents=True, exist_ok=True)
         (out / "manifest.json").write_text(json.dumps(MANIFEST), encoding="utf-8")
         (out / "flop.bin.br").write_bytes(b"flop-blob")
         (out / "turn" / "2s.bin.br").write_bytes(b"turn-blob")
-        for path in out.rglob("*"):
-            if path.is_file():
-                key = R.build_key(JOB["blob_prefix"], path.relative_to(out))
-                _sizes[key] = path.stat().st_size
 
     with mock.patch.object(R, "run_estimate", return_value=estimate), mock.patch.object(
         R, "run_solve", side_effect=fake_solve
@@ -452,6 +591,8 @@ def test_handle_job_success_uploads_and_completes(config, tmp_path):
     assert "files" not in kwargs["manifest"]
 
     assert r2.put_object.call_count == 3
+    # HEAD 검증을 없앴으니 put_object 성공 응답 외에는 아무것도 안 부른다.
+    r2.head_object.assert_not_called()
     # work 디렉토리는 성공 후 지운다.
     assert not runner.job_dir(42).exists()
 
@@ -478,7 +619,7 @@ def test_handle_job_upload_failure_posts_fail(config):
     runner = R.Runner(config, api=api, r2=r2)
     estimate = {"memoryBytes": {"uncompressed": 1024**3}}
 
-    def fake_solve(solver_bin, config_path, out_dir, *args):
+    def fake_solve(solver_bin, config_path, out_dir, *args, **kwargs):
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         (out / "manifest.json").write_text(json.dumps(MANIFEST), encoding="utf-8")
