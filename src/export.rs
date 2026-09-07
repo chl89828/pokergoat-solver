@@ -18,6 +18,9 @@ use crate::tree::Isomorphism;
 /// 도달 확률이 이 값보다 낮은 플레이어 노드는 본문 없이 헤더만 남긴다.
 pub const DEFAULT_PRUNE_EPSILON: f64 = 1e-5;
 
+/// 리버 플레이어 노드에 EV 배열을 담을지의 기본값.
+pub const DEFAULT_RIVER_EV: bool = true;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BlobKey {
     /// 시작 스트리트 파일
@@ -48,14 +51,44 @@ pub struct ExportSummary {
     pub warnings: Vec<String>,
     pub bytes_raw: u64,
     pub bytes_stored: u64,
+    /// 본문(전략)을 담은 리버 플레이어 노드 수. 프룬된 노드는 세지 않는다.
+    pub river_player_nodes: u64,
+    /// blob 직렬화 + 압축 + 파일 쓰기에 걸린 시간
+    pub write_sec: f64,
 }
 
 pub struct ExportOptions {
     pub header: BlobHeader,
     pub store_river: bool,
     pub prune_epsilon: f64,
+    /// 리버 스트리트 플레이어 노드에만 적용하는 프룬 임계값.
+    /// `prune_epsilon`과 같은 값을 넣으면 동작이 예전과 같다.
+    pub river_prune_epsilon: f64,
+    /// 리버 플레이어 노드에 EV 배열을 담을지. false면 전략만 쓰고 `FLAG_HAS_EV`를 끈다.
+    pub river_ev: bool,
     pub compress: bool,
     pub out_dir: PathBuf,
+}
+
+impl ExportOptions {
+    /// 리버 옵션을 기본값(플랍·턴과 같은 프룬 임계값, EV 포함)으로 채운다.
+    pub fn new(
+        header: BlobHeader,
+        store_river: bool,
+        prune_epsilon: f64,
+        compress: bool,
+        out_dir: PathBuf,
+    ) -> Self {
+        Self {
+            header,
+            store_river,
+            prune_epsilon,
+            river_prune_epsilon: prune_epsilon,
+            river_ev: DEFAULT_RIVER_EV,
+            compress,
+            out_dir,
+        }
+    }
 }
 
 pub fn export(
@@ -124,7 +157,9 @@ impl<'a> Exporter<'a> {
         self.game.back_to_root();
         let mut history: Vec<usize> = Vec::new();
         self.walk(BlobKey::Start, &mut history)?;
+        let started = std::time::Instant::now();
         self.write_files()?;
+        self.summary.write_sec = started.elapsed().as_secs_f64();
         let mut summary = std::mem::take(&mut self.summary);
         summary.turn_cards.sort();
         summary.turn_cards.dedup();
@@ -305,6 +340,8 @@ impl<'a> Exporter<'a> {
     fn walk_player(&mut self, key: BlobKey, index: u32, history: &mut Vec<usize>) -> Result<u32> {
         let invest = self.invest();
         let player = self.game.current_player();
+        // 보드 5장이면 리버다. 시작 스트리트가 어디든 이 판정이 성립한다.
+        let is_river = self.game.current_board().len() == 5;
         let actions: Vec<Action> = self.game.available_actions();
         let blob_actions: Vec<BlobAction> = actions.iter().map(action_to_blob).collect();
         let n_actions = actions.len();
@@ -313,7 +350,12 @@ impl<'a> Exporter<'a> {
         let weight_sum: f64 = self.game.weights(player).iter().map(|&w| w as f64).sum();
         let reach = weight_sum / self.root_weight_sum[player];
 
-        if reach < self.options.prune_epsilon {
+        let prune_epsilon = if is_river {
+            self.options.river_prune_epsilon
+        } else {
+            self.options.prune_epsilon
+        };
+        if reach < prune_epsilon {
             let node = &mut self.blobs.get_mut(&key).unwrap().nodes[index as usize];
             node.kind = KIND_PLAYER;
             node.player = player as u8;
@@ -325,19 +367,36 @@ impl<'a> Exporter<'a> {
             return Ok(index);
         }
 
-        self.game.cache_normalized_weights();
+        // 리버 EV를 끄면 계산 자체를 건너뛴다. 파일 크기와 export 시간이 같이 줄어든다.
+        // 정규화 가중치 캐시는 EV 계산에만 필요해서 같이 건너뛴다. 전략 배열은 영향받지 않는다
+        // (테스트 river_ev_off_drops_ev_only_on_the_river가 두 경로의 전략 바이트를 맞춰 본다).
+        let store_ev = !is_river || self.options.river_ev;
         let strategy = self.game.strategy();
-        let ev_chips = self.game.expected_values_detail(player);
-        if strategy.len() != n_actions * n_hands || ev_chips.len() != n_actions * n_hands {
+        if strategy.len() != n_actions * n_hands {
             bail!(
-                "전략/EV 길이가 예상과 다르다 (actions {n_actions}, hands {n_hands}, strategy {}, ev {})",
-                strategy.len(),
-                ev_chips.len()
+                "전략 길이가 예상과 다르다 (actions {n_actions}, hands {n_hands}, strategy {})",
+                strategy.len()
             );
         }
-        let ev_bb: Vec<f32> = ev_chips.iter().map(|v| v / CHIP_SCALE as f32).collect();
         let quantized = quantize_strategy(&strategy, n_actions, n_hands);
-        let (ev, ev_scale) = quantize_ev(&ev_bb);
+        let (ev, ev_scale) = if store_ev {
+            self.game.cache_normalized_weights();
+            let ev_chips = self.game.expected_values_detail(player);
+            if ev_chips.len() != n_actions * n_hands {
+                bail!(
+                    "EV 길이가 예상과 다르다 (actions {n_actions}, hands {n_hands}, ev {})",
+                    ev_chips.len()
+                );
+            }
+            let ev_bb: Vec<f32> = ev_chips.iter().map(|v| v / CHIP_SCALE as f32).collect();
+            quantize_ev(&ev_bb)
+        } else {
+            // EV 없음. 오프셋은 직렬화 때 u64::MAX가 되고 스케일은 의미가 없어 0으로 둔다.
+            (Vec::new(), 0.0)
+        };
+        if is_river {
+            self.summary.river_player_nodes += 1;
+        }
 
         let mut children = Vec::with_capacity(n_actions);
         for action_index in 0..n_actions {
@@ -352,7 +411,7 @@ impl<'a> Exporter<'a> {
         let node = &mut self.blobs.get_mut(&key).unwrap().nodes[index as usize];
         node.kind = KIND_PLAYER;
         node.player = player as u8;
-        node.flags = FLAG_HAS_EV;
+        node.flags = if store_ev { FLAG_HAS_EV } else { 0 };
         node.actions = blob_actions;
         node.children = children;
         node.invest = invest;

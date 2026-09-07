@@ -50,6 +50,7 @@ docker run --rm -v "$PWD":/work \
 ```
 pokergoat-solver estimate --config job.json
 pokergoat-solver solve --config job.json --out DIR [--threads N] [--time-limit SEC] [--no-compress]
+                       [--memory auto|full|compressed] [--river-ev on|off] [--river-prune-reach F]
 pokergoat-solver aggregate --scenario-dir DIR --out DIR
 pokergoat-solver validate [--iterations N]
 ```
@@ -79,8 +80,19 @@ pokergoat-solver validate [--iterations N]
 `--threads`는 rayon 스레드 수이고 기본값은 코어 수다. `--no-compress`는 brotli를 건너뛰고
 `.bin`을 그대로 쓴다. 디버깅과 픽스처 생성용이다.
 
+`storeRiver`가 켜진 잡은 리버 노드가 용량을 다 먹는다. 그걸 깎는 스위치가 둘이다.
+`--river-ev off`는 리버 플레이어 노드에서 EV 배열을 빼고 전략만 남긴다(`FLAG_HAS_EV`가
+꺼지고 `evOffset`은 `u64::MAX`). `--river-prune-reach 0.001`은 도달 확률이 그 값 미만인
+리버 노드를 헤더만 남기고 자른다. 잘린 노드의 서브트리는 파일에 아예 들어가지 않아서
+노드 수도 같이 준다. 플랍과 턴은 기존 임계값 1e-5 그대로다.
+
+두 값은 잡 JSON의 `riverEv`, `riverPruneReach`로도 줄 수 있고 CLI 플래그가 이긴다.
+실제로 적용된 값은 manifest의 `riverEv`, `riverPruneReach`에 적힌다.
+
 manifest에는 익스플로이터빌리티, 반복 횟수, 경과 시간, 노드 수, 메모리, 파일별 크기,
-솔버 버전, 템플릿 id, 턴 대표 카드 목록과 동형 매핑이 들어간다.
+솔버 버전, 템플릿 id, 턴 대표 카드 목록과 동형 매핑이 들어간다. 리버 옵션 관련으로는
+`riverEv`, `riverPruneReach`, `riverPlayerNodes`(본문을 담은 리버 플레이어 노드 수),
+`exportSec`와 `exportWriteSec`(export 전체 시간과 그중 직렬화·압축·쓰기 시간)가 더 있다.
 
 ### validate
 
@@ -143,6 +155,8 @@ CI와 러너 기동 시 자가 점검으로 돌린다.
 - `rake`는 `{percent, capBb}`. 없으면 레이크 0이다.
 - `donk`는 OOP 돈벳 사이즈다. 플랍 돈벳은 개념상 없다.
 - `storeRiver`가 true면 리버 blob까지 쓴다. 파일 수와 용량이 수십 배로 뛴다.
+- `riverEv`가 false면 리버 플레이어 노드를 EV 없이 쓴다. 기본은 true다.
+- `riverPruneReach`는 리버 노드에만 쓰는 프룬 임계값이다. 없으면 일반 임계값(1e-5)과 같다.
 - `targetExploitability`는 % pot이고, 이 값에 도달하면 반복을 멈춘다.
 
 ### maxRaisesPerStreet은 무시한다

@@ -123,10 +123,15 @@ node[0], node[1], ... node[nodeCount - 1]
 
 ### pruned 노드
 
-액션 플레이어의 레인지 도달 확률이 1e-5 미만이면 본문 없이 헤더만 남긴다.
+액션 플레이어의 레인지 도달 확률이 임계값 미만이면 본문 없이 헤더만 남긴다.
 도달 확률은 그 노드에서의 해당 플레이어 가중치 합을 루트에서의 가중치 합으로 나눈 값이다.
 pruned 노드는 `flags & 1`이 켜져 있고, 전략과 EV 오프셋이 `u64::MAX`이며, 자식이 전부
 `0xFFFFFFFE`다. 액션 목록은 그대로 있으니 화면에는 균등 전략과 "저도달" 배지로 표시해라.
+
+임계값 기본은 1e-5이고 `manifest.json`의 `pruneEpsilon`에 적힌다. 리버 노드만 따로
+더 세게 자를 수 있는데, 그때 쓴 값은 `riverPruneReach`에 남는다. 잘린 노드의 서브트리는
+아예 파일에 들어가지 않으므로 리버 임계값을 올리면 노드 수와 파일 크기가 같이 줄어든다.
+`riverPruneReach`가 `pruneEpsilon`과 같으면 스트리트별 차이가 없다는 뜻이다.
 
 ## 5. 전략
 
@@ -153,9 +158,15 @@ function probability(action, hand) {
 
 ## 6. EV
 
-`flags & 2`가 켜진 노드만 EV를 가진다. 플랍과 턴의 플레이어 노드가 대상이고, `storeRiver`가
-true면 리버 플레이어 노드도 포함한다. 배열은 i16이고 길이는 `nActions * hands[player]`,
+`flags & 2`가 켜진 노드만 EV를 가진다. 배열은 i16이고 길이는 `nActions * hands[player]`,
 배치는 전략과 같은 액션 우선이다.
+
+플랍과 턴의 플레이어 노드는 항상 EV를 가진다. 리버 플레이어 노드는 EV가 없을 수도 있다.
+리버 노드의 EV는 배포 용량의 대부분을 차지해서(노드마다 2바이트 × 액션 수 × 핸드 수)
+빼고 내보내는 선택지가 있기 때문이다. 그렇게 나온 리버 노드는 `flags & 2`가 꺼져 있고
+`evOffset`이 `u64::MAX`, `evScale`이 0이다. 전략은 그대로 있으므로 리버에서도 액션 빈도는
+읽을 수 있고, EV 숫자만 화면에서 빼면 된다. 어느 쪽으로 나왔는지는 `manifest.json`의
+`riverEv`(true/false)로 판단해라. 파서는 이 값을 보지 않고도 `flags & 2`만 확인하면 된다.
 
 ```js
 const evBb = readInt16LE(base + (action * hands + hand) * 2) * node.evScale;

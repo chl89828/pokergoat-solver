@@ -7,7 +7,9 @@ use pokergoat_solver::blob::{
     FLAG_PRUNED, KIND_CHANCE, KIND_PLAYER,
 };
 use pokergoat_solver::config::JobConfig;
-use pokergoat_solver::export::{decompress, export, ExportOptions, DEFAULT_PRUNE_EPSILON};
+use pokergoat_solver::export::{
+    decompress, export, ExportOptions, ExportSummary, DEFAULT_PRUNE_EPSILON,
+};
 use pokergoat_solver::solve::run_solver;
 use pokergoat_solver::{blob::BlobHeader, cards, tree, SOLVER_VERSION};
 
@@ -87,13 +89,7 @@ fn solve_export_and_read_back() {
     let summary = export(
         &mut built.game,
         &built.isomorphism,
-        ExportOptions {
-            header,
-            store_river: false,
-            prune_epsilon: DEFAULT_PRUNE_EPSILON,
-            compress: true,
-            out_dir: out.clone(),
-        },
+        ExportOptions::new(header, false, DEFAULT_PRUNE_EPSILON, true, out.clone()),
     )
     .unwrap();
 
@@ -237,13 +233,7 @@ fn turn_start_stores_river_files() {
     let summary = export(
         &mut built.game,
         &built.isomorphism,
-        ExportOptions {
-            header,
-            store_river: true,
-            prune_epsilon: DEFAULT_PRUNE_EPSILON,
-            compress: true,
-            out_dir: out.clone(),
-        },
+        ExportOptions::new(header, true, DEFAULT_PRUNE_EPSILON, true, out.clone()),
     )
     .unwrap();
 
@@ -332,13 +322,7 @@ fn monotone_flop_uses_chance_isomorphism() {
     let summary = export(
         &mut built.game,
         &built.isomorphism,
-        ExportOptions {
-            header,
-            store_river: false,
-            prune_epsilon: DEFAULT_PRUNE_EPSILON,
-            compress: true,
-            out_dir: out.clone(),
-        },
+        ExportOptions::new(header, false, DEFAULT_PRUNE_EPSILON, true, out.clone()),
     )
     .unwrap();
 
@@ -393,13 +377,7 @@ fn pruned_nodes_keep_only_the_header() {
     let summary = export(
         &mut built.game,
         &built.isomorphism,
-        ExportOptions {
-            header,
-            store_river: false,
-            prune_epsilon: 1.0,
-            compress: false,
-            out_dir: out.clone(),
-        },
+        ExportOptions::new(header, false, 1.0, false, out.clone()),
     )
     .unwrap();
     assert!(summary.pruned_nodes > 0);
@@ -420,4 +398,247 @@ fn pruned_nodes_keep_only_the_header() {
     assert!(pruned.children.iter().all(|&c| c == CHILD_NOT_STORED));
 
     std::fs::remove_dir_all(&out).ok();
+}
+
+/// 리버 옵션 실험용 잡. 리버에 사이즈를 두 개 주고 레이즈를 열어 리버 서브트리를 키운다.
+const RIVER_OPTION_JOB: &str = r#"{
+    "board": "As7d2cKh",
+    "ranges": ["AA,KK,QQ,JJ", "AQs+,KQs,QJs,JTs,T9s,99,88,77"],
+    "pot": 10,
+    "effectiveStack": 40,
+    "sizing": {
+        "turn": { "oop": { "bet": [66], "raise": [50] }, "ip": { "bet": [66], "raise": [50] } },
+        "river": { "oop": { "bet": [33, 100], "raise": [50] }, "ip": { "bet": [33, 100], "raise": [50] } }
+    },
+    "maxRaisesPerStreet": 2,
+    "iterations": 50,
+    "targetExploitability": 0.5,
+    "storeRiver": true
+}"#;
+
+struct RiverFixture {
+    built: tree::BuiltGame,
+    board: Vec<u8>,
+    pot: f32,
+    stack: f32,
+}
+
+impl RiverFixture {
+    fn solve() -> Self {
+        let config = JobConfig::from_str(RIVER_OPTION_JOB).unwrap();
+        let mut built = tree::build_game(&config).unwrap();
+        built.game.allocate_memory(false);
+        run_solver(
+            &mut built.game,
+            config.iterations,
+            config.target_exploitability_chips(),
+            None,
+            false,
+        )
+        .unwrap();
+        Self {
+            board: config.board_cards().unwrap(),
+            pot: config.pot as f32,
+            stack: config.effective_stack as f32,
+            built,
+        }
+    }
+
+    fn header(&self) -> BlobHeader {
+        BlobHeader {
+            scenario_id: 0,
+            template_id: 0,
+            solver_version: SOLVER_VERSION,
+            board: self.board.clone(),
+            street: 1,
+            starting_pot: self.pot,
+            effective_stack: self.stack,
+            rake_percent: 0.0,
+            rake_cap: 0.0,
+            exploitability_pct: 0.0,
+            iterations: 0,
+        }
+    }
+
+    /// 같은 솔브 결과를 옵션만 바꿔 여러 번 내보낸다.
+    fn export_with(
+        &mut self,
+        tag: &str,
+        river_prune_epsilon: f64,
+        river_ev: bool,
+    ) -> (std::path::PathBuf, ExportSummary) {
+        let out = temp_dir(tag);
+        let mut options =
+            ExportOptions::new(self.header(), true, DEFAULT_PRUNE_EPSILON, false, out.clone());
+        options.river_prune_epsilon = river_prune_epsilon;
+        options.river_ev = river_ev;
+        let summary = export(&mut self.built.game, &self.built.isomorphism, options).unwrap();
+        (out, summary)
+    }
+}
+
+fn read_blob(path: &std::path::Path) -> Blob {
+    Blob::parse(&std::fs::read(path).unwrap()).unwrap()
+}
+
+fn river_paths(summary: &ExportSummary) -> Vec<String> {
+    summary
+        .files
+        .iter()
+        .filter(|f| f.path.starts_with("river/"))
+        .map(|f| f.path.clone())
+        .collect()
+}
+
+/// `river_ev = false`면 리버 플레이어 노드에서 EV가 빠진다.
+/// 턴 노드는 그대로 EV를 들고 있어야 하고, 파일은 작아져야 한다.
+#[test]
+fn river_ev_off_drops_ev_only_on_the_river() {
+    let mut fixture = RiverFixture::solve();
+    let (with_ev_dir, with_ev) = fixture.export_with("river-ev-on", DEFAULT_PRUNE_EPSILON, true);
+    let (no_ev_dir, no_ev) = fixture.export_with("river-ev-off", DEFAULT_PRUNE_EPSILON, false);
+
+    assert_eq!(
+        with_ev.node_count, no_ev.node_count,
+        "EV만 뺐으니 노드 수는 그대로여야 한다"
+    );
+    assert!(
+        no_ev.bytes_raw < with_ev.bytes_raw,
+        "EV를 빼면 파일이 작아야 한다: {} -> {}",
+        with_ev.bytes_raw,
+        no_ev.bytes_raw
+    );
+    println!(
+        "river_ev on {} bytes / off {} bytes (리버 노드 {})",
+        with_ev.bytes_raw, no_ev.bytes_raw, with_ev.river_player_nodes
+    );
+
+    // 턴 파일은 그대로 EV를 들고 있다
+    let turn = read_blob(&no_ev_dir.join("turn.bin"));
+    let turn_players = turn.nodes.iter().filter(|n| n.kind == KIND_PLAYER);
+    let mut turn_checked = 0;
+    for node in turn_players {
+        if node.flags & FLAG_PRUNED != 0 {
+            continue;
+        }
+        assert_eq!(node.flags & FLAG_HAS_EV, FLAG_HAS_EV, "턴 노드 EV가 빠졌다");
+        assert!(!node.ev.is_empty());
+        turn_checked += 1;
+    }
+    assert!(turn_checked > 0, "턴 플레이어 노드가 있어야 한다");
+
+    // 리버 파일은 EV가 없다. 전략은 그대로 읽힌다 (라운드트립)
+    let paths = river_paths(&no_ev);
+    assert!(!paths.is_empty(), "리버 파일이 있어야 한다");
+    let mut river_checked = 0;
+    for path in &paths {
+        let bytes = std::fs::read(no_ev_dir.join(path)).unwrap();
+        let blob = Blob::parse(&bytes).unwrap();
+        assert_eq!(blob.to_bytes().unwrap(), bytes, "라운드트립 실패: {path}");
+        assert_eq!(blob.header.street, 2);
+        for node in &blob.nodes {
+            if node.kind != KIND_PLAYER || node.flags & FLAG_PRUNED != 0 {
+                continue;
+            }
+            assert_eq!(node.flags & FLAG_HAS_EV, 0, "리버 EV 플래그가 남았다");
+            assert!(node.ev.is_empty(), "리버 EV 배열이 남았다");
+            assert_eq!(node.ev_scale, 0.0);
+            let hands = blob.hands[node.player as usize].len();
+            let n_actions = node.actions.len();
+            assert_eq!(node.strategy.len(), (n_actions - 1) * hands, "전략은 남는다");
+            let decoded = dequantize_strategy(&node.strategy, n_actions, hands);
+            for hand in 0..hands {
+                let sum: f32 = (0..n_actions).map(|a| decoded[a * hands + hand]).sum();
+                assert!((sum - 1.0).abs() < 1e-6, "핸드 {hand} 전략 합 {sum}");
+            }
+            river_checked += 1;
+        }
+    }
+    assert!(river_checked > 0, "리버 플레이어 노드가 있어야 한다");
+
+    // 같은 리버 파일끼리 비교해도 작아진다. 줄어드는 건 EV뿐이고 전략은 그대로다.
+    let sample = &paths[0];
+    let on = std::fs::metadata(with_ev_dir.join(sample)).unwrap().len();
+    let off = std::fs::metadata(no_ev_dir.join(sample)).unwrap().len();
+    assert!(off < on, "리버 파일 {sample}: {on} -> {off}");
+
+    for path in &paths {
+        let with_blob = read_blob(&with_ev_dir.join(path));
+        let without_blob = read_blob(&no_ev_dir.join(path));
+        assert_eq!(with_blob.header, without_blob.header, "{path} 헤더");
+        assert_eq!(with_blob.nodes.len(), without_blob.nodes.len(), "{path} 노드 수");
+        for (a, b) in with_blob.nodes.iter().zip(without_blob.nodes.iter()) {
+            assert_eq!(a.kind, b.kind);
+            assert_eq!(a.children, b.children);
+            assert_eq!(a.invest, b.invest);
+            assert_eq!(a.strategy, b.strategy, "{path} 노드 {} 전략이 달라졌다", a.id);
+        }
+    }
+
+    std::fs::remove_dir_all(&with_ev_dir).ok();
+    std::fs::remove_dir_all(&no_ev_dir).ok();
+}
+
+/// 리버 프룬 임계값을 올리면 본문을 담는 리버 노드가 줄어든다.
+/// 턴 이전 스트리트는 `prune_epsilon`을 그대로 쓰므로 영향이 없어야 한다.
+#[test]
+fn river_prune_epsilon_stores_fewer_river_nodes() {
+    let mut fixture = RiverFixture::solve();
+    let (loose_dir, loose) = fixture.export_with("river-prune-low", 1e-5, true);
+    let (tight_dir, tight) = fixture.export_with("river-prune-high", 1e-3, true);
+
+    println!(
+        "리버 노드 1e-5 {} / 1e-3 {} (전체 노드 {} -> {}, bytes {} -> {})",
+        loose.river_player_nodes,
+        tight.river_player_nodes,
+        loose.node_count,
+        tight.node_count,
+        loose.bytes_raw,
+        tight.bytes_raw
+    );
+    assert!(
+        tight.river_player_nodes < loose.river_player_nodes,
+        "1e-3에서 저장 리버 노드가 더 적어야 한다: {} vs {}",
+        tight.river_player_nodes,
+        loose.river_player_nodes
+    );
+    assert!(tight.pruned_nodes > loose.pruned_nodes);
+    assert!(tight.node_count < loose.node_count);
+    assert!(tight.bytes_raw < loose.bytes_raw);
+
+    // 턴 플레이어 노드는 그대로다 (리버 임계값이 앞 스트리트에 새지 않는다).
+    // 턴 파일의 찬스 노드 자식 인덱스는 리버 파일의 노드 번호라서 달라질 수 있다.
+    let loose_turn = read_blob(&loose_dir.join("turn.bin"));
+    let tight_turn = read_blob(&tight_dir.join("turn.bin"));
+    assert_eq!(loose_turn.nodes.len(), tight_turn.nodes.len());
+    let mut compared = 0;
+    for (a, b) in loose_turn.nodes.iter().zip(tight_turn.nodes.iter()) {
+        assert_eq!(a.kind, b.kind);
+        if a.kind != KIND_PLAYER {
+            continue;
+        }
+        assert_eq!(a.flags, b.flags, "노드 {} 플래그", a.id);
+        assert_eq!(a.strategy, b.strategy, "노드 {} 전략", a.id);
+        assert_eq!(a.ev, b.ev, "노드 {} EV", a.id);
+        compared += 1;
+    }
+    assert!(compared > 0, "턴 플레이어 노드가 있어야 한다");
+
+    // 잘린 리버 노드는 헤더만 남고 자식이 미저장이다
+    let mut saw_pruned = false;
+    for path in river_paths(&tight) {
+        let blob = read_blob(&tight_dir.join(&path));
+        for node in &blob.nodes {
+            if node.kind == KIND_PLAYER && node.flags & FLAG_PRUNED != 0 {
+                assert!(node.strategy.is_empty());
+                assert!(node.ev.is_empty());
+                assert!(node.children.iter().all(|&c| c == CHILD_NOT_STORED));
+                saw_pruned = true;
+            }
+        }
+    }
+    assert!(saw_pruned, "잘린 리버 노드가 있어야 한다");
+
+    std::fs::remove_dir_all(&loose_dir).ok();
+    std::fs::remove_dir_all(&tight_dir).ok();
 }

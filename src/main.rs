@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use pokergoat_solver::blob::BlobHeader;
 use pokergoat_solver::config::JobConfig;
-use pokergoat_solver::export::{ExportOptions, DEFAULT_PRUNE_EPSILON};
+use pokergoat_solver::export::{ExportOptions, DEFAULT_PRUNE_EPSILON, DEFAULT_RIVER_EV};
 use pokergoat_solver::{
     aggregate, blob, cards, export, solve, tree, validate, ENGINE_REV, SOLVER_VERSION,
 };
@@ -48,6 +48,13 @@ enum Command {
         /// 엔진 메모리 모드: auto(8GiB 초과 시 압축) / full / compressed
         #[arg(long = "memory", default_value = "auto")]
         memory: String,
+        /// 리버 노드 전용 프룬 도달 임계값. 없으면 잡 JSON의 riverPruneReach,
+        /// 그것도 없으면 일반 프룬 임계값과 같다
+        #[arg(long = "river-prune-reach")]
+        river_prune_reach: Option<f64>,
+        /// 리버 플레이어 노드에 EV를 담을지 (on / off). 없으면 잡 JSON의 riverEv, 기본 on
+        #[arg(long = "river-ev", value_parser = parse_on_off)]
+        river_ev: Option<bool>,
         /// 노드락 (자리만 있고 아직 구현하지 않았다, §4.6)
         #[arg(long)]
         lock: Option<String>,
@@ -92,13 +99,29 @@ fn run(cli: Cli) -> Result<i32> {
             time_limit,
             no_compress,
             memory,
+            river_prune_reach,
+            river_ev,
             lock,
         } => {
             if lock.is_some() {
                 bail!("--lock은 아직 구현하지 않았다 (§4.6)");
             }
             let memory_mode = MemoryMode::parse(&memory)?;
-            solve_job(&config, &out, threads, time_limit, !no_compress, memory_mode)?;
+            if let Some(value) = river_prune_reach {
+                if !(0.0..=1.0).contains(&value) {
+                    bail!("--river-prune-reach는 0..1 범위여야 한다: {value}");
+                }
+            }
+            solve_job(
+                &config,
+                &out,
+                threads,
+                time_limit,
+                !no_compress,
+                memory_mode,
+                river_prune_reach,
+                river_ev,
+            )?;
             Ok(0)
         }
         Command::Aggregate { scenario_dir, out } => {
@@ -110,6 +133,15 @@ fn run(cli: Cli) -> Result<i32> {
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(if result.pass { 0 } else { 1 })
         }
+    }
+}
+
+/// `--river-ev on|off`. 헷갈릴 여지를 줄이려고 true/false와 1/0도 받는다.
+fn parse_on_off(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "yes" => Ok(true),
+        "off" | "false" | "0" | "no" => Ok(false),
+        other => Err(format!("on 또는 off여야 한다: {other}")),
     }
 }
 
@@ -206,6 +238,7 @@ impl MemoryMode {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn solve_job(
     config_path: &PathBuf,
     out_dir: &PathBuf,
@@ -213,6 +246,8 @@ fn solve_job(
     time_limit: Option<f64>,
     compress: bool,
     memory_mode: MemoryMode,
+    river_prune_reach: Option<f64>,
+    river_ev: Option<bool>,
 ) -> Result<()> {
     set_threads(threads)?;
     let config = JobConfig::from_path(config_path)?;
@@ -263,6 +298,17 @@ fn solve_job(
         iterations: outcome.iterations,
     };
 
+    // CLI 플래그가 잡 JSON보다 우선한다. 둘 다 없으면 예전과 같은 동작.
+    let river_prune_epsilon = river_prune_reach
+        .or(config.river_prune_reach)
+        .unwrap_or(DEFAULT_PRUNE_EPSILON);
+    let river_ev = river_ev.or(config.river_ev).unwrap_or(DEFAULT_RIVER_EV);
+    eprintln!(
+        "export 시작 (리버 프룬 {river_prune_epsilon}, 리버 EV {})",
+        if river_ev { "on" } else { "off" }
+    );
+
+    let export_started = std::time::Instant::now();
     let summary = export::export(
         &mut built.game,
         &built.isomorphism,
@@ -270,10 +316,19 @@ fn solve_job(
             header,
             store_river: config.store_river,
             prune_epsilon: DEFAULT_PRUNE_EPSILON,
+            river_prune_epsilon,
+            river_ev,
             compress,
             out_dir: out_dir.clone(),
         },
     )?;
+    let export_sec = export_started.elapsed().as_secs_f64();
+    eprintln!(
+        "export 완료 {export_sec:.1}s (그중 직렬화·압축·쓰기 {:.1}s), 파일 {}개, 노드 {}",
+        summary.write_sec,
+        summary.files.len(),
+        summary.node_count
+    );
 
     let mut warnings = built.warnings.clone();
     warnings.extend(summary.warnings.iter().cloned());
@@ -310,6 +365,11 @@ fn solve_job(
         "nodeCount": summary.node_count,
         "prunedNodes": summary.pruned_nodes,
         "pruneEpsilon": DEFAULT_PRUNE_EPSILON,
+        "riverPruneReach": river_prune_epsilon,
+        "riverEv": river_ev,
+        "riverPlayerNodes": summary.river_player_nodes,
+        "exportSec": export_sec,
+        "exportWriteSec": summary.write_sec,
         "hands": [
             built.game.private_cards(0).len(),
             built.game.private_cards(1).len()
@@ -325,4 +385,75 @@ fn solve_job(
     export::write_manifest(&out_dir.join("manifest.json"), &manifest)?;
     println!("{}", serde_json::to_string_pretty(&manifest)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn solve_flags(argv: &[&str]) -> (Option<f64>, Option<bool>) {
+        let cli = Cli::try_parse_from(argv).expect("파싱 실패");
+        match cli.command {
+            Command::Solve {
+                river_prune_reach,
+                river_ev,
+                ..
+            } => (river_prune_reach, river_ev),
+            _ => panic!("solve 서브커맨드가 아니다"),
+        }
+    }
+
+    const BASE: [&str; 6] = [
+        "pokergoat-solver",
+        "solve",
+        "--config",
+        "job.json",
+        "--out",
+        "out",
+    ];
+
+    #[test]
+    fn river_flags_default_to_none() {
+        assert_eq!(solve_flags(&BASE), (None, None));
+    }
+
+    #[test]
+    fn river_flags_parse() {
+        let mut argv = BASE.to_vec();
+        argv.extend(["--river-prune-reach", "0.001", "--river-ev", "off"]);
+        let (reach, ev) = solve_flags(&argv);
+        assert_eq!(reach, Some(0.001));
+        assert_eq!(ev, Some(false));
+
+        let mut argv = BASE.to_vec();
+        argv.extend(["--river-ev", "on"]);
+        assert_eq!(solve_flags(&argv).1, Some(true));
+    }
+
+    #[test]
+    fn river_ev_rejects_garbage() {
+        let mut argv = BASE.to_vec();
+        argv.extend(["--river-ev", "maybe"]);
+        assert!(Cli::try_parse_from(&argv).is_err());
+    }
+
+    #[test]
+    fn on_off_accepts_common_spellings() {
+        for value in ["on", "ON", "true", "1", "yes"] {
+            assert_eq!(parse_on_off(value), Ok(true), "{value}");
+        }
+        for value in ["off", "OFF", "false", "0", "no"] {
+            assert_eq!(parse_on_off(value), Ok(false), "{value}");
+        }
+        assert!(parse_on_off("").is_err());
+        assert!(parse_on_off("nope").is_err());
+    }
+
+    #[test]
+    fn memory_mode_parses() {
+        assert_eq!(MemoryMode::parse("auto").unwrap(), MemoryMode::Auto);
+        assert_eq!(MemoryMode::parse("full").unwrap(), MemoryMode::Full);
+        assert!(MemoryMode::parse("half").is_err());
+    }
 }

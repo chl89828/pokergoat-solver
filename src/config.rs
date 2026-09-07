@@ -123,6 +123,14 @@ pub struct JobConfig {
     /// 리버 blob 저장 여부
     #[serde(default)]
     pub store_river: bool,
+    /// 리버 노드 전용 프룬 도달 임계값. 없으면 일반 프룬 임계값을 그대로 쓴다.
+    /// CLI의 `--river-prune-reach`가 이 값을 덮어쓴다.
+    #[serde(default)]
+    pub river_prune_reach: Option<f64>,
+    /// 리버 플레이어 노드에 EV를 담을지. 없으면 담는다(기존 동작).
+    /// CLI의 `--river-ev`가 이 값을 덮어쓴다.
+    #[serde(default)]
+    pub river_ev: Option<bool>,
     /// blob 헤더에 적히는 메타
     #[serde(default)]
     pub scenario_id: u32,
@@ -237,6 +245,11 @@ impl JobConfig {
         }
         if self.target_exploitability < 0.0 {
             bail!("targetExploitability는 0 이상이어야 한다");
+        }
+        if let Some(reach) = self.river_prune_reach {
+            if !(0.0..=1.0).contains(&reach) {
+                bail!("riverPruneReach는 0..1 범위여야 한다: {reach}");
+            }
         }
         if let Some(rake) = &self.rake {
             if !(0.0..=100.0).contains(&rake.percent) {
@@ -390,6 +403,30 @@ mod tests {
     #[test]
     fn rejects_bad_range() {
         assert!(JobConfig::from_str(&SAMPLE.replace("\"22+,A2s+\"", "\"ZZ\"")).is_err());
+    }
+
+    #[test]
+    fn river_options_default_to_none() {
+        let config = JobConfig::from_str(SAMPLE).unwrap();
+        assert!(config.river_prune_reach.is_none());
+        assert!(config.river_ev.is_none());
+    }
+
+    #[test]
+    fn parses_river_options() {
+        let text = SAMPLE.replace(
+            "\"storeRiver\": false",
+            "\"storeRiver\": true, \"riverPruneReach\": 0.001, \"riverEv\": false",
+        );
+        let config = JobConfig::from_str(&text).unwrap();
+        assert_eq!(config.river_prune_reach, Some(0.001));
+        assert_eq!(config.river_ev, Some(false));
+    }
+
+    #[test]
+    fn rejects_river_prune_reach_out_of_range() {
+        let text = SAMPLE.replace("\"storeRiver\": false", "\"riverPruneReach\": 2.5");
+        assert!(JobConfig::from_str(&text).is_err());
     }
 
     #[test]
