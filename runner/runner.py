@@ -43,6 +43,8 @@ RUNNER_DIR = Path(__file__).resolve().parent
 RUNNER_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 MAX_MANIFEST_CHARS = 16384
 MAX_ERROR_CHARS = 2000
+# API가 재시도 없이 실패 처리하는 사유 (apps/solver/services.py NO_RETRY_REASONS와 맞춘다)
+NO_RETRY_REASONS = ("memory",)
 # exploitability는 DecimalField(max_digits=8, decimal_places=4, min_value=0).
 EXPLOITABILITY_DECIMALS = 4
 EXPLOITABILITY_MAX = 9999.9999
@@ -100,7 +102,14 @@ class RunnerStopped(Exception):
 
 
 class JobFailure(Exception):
-    """이 잡은 실패했다. message가 API의 error 필드로 간다."""
+    """이 잡은 실패했다. message가 API의 error 필드로 간다.
+
+    reason이 "memory"면 API가 재시도 없이 바로 failed로 둔다(설계서 §6.2).
+    """
+
+    def __init__(self, message, reason=None):
+        super().__init__(message)
+        self.reason = reason
 
 
 def log(message):
@@ -310,11 +319,14 @@ class ApiClient:
         }
         self._post(f"jobs/{job_id}/complete/", payload)
 
-    def fail(self, job_id, error):
+    def fail(self, job_id, error, reason=None):
         payload = {
             "runner_id": self.runner_id,
             "error": (error or "")[-MAX_ERROR_CHARS:],
         }
+        if reason:
+            payload["reason"] = reason
+            payload["retry"] = reason not in NO_RETRY_REASONS
         self._post(f"jobs/{job_id}/fail/", payload)
 
 
@@ -498,7 +510,8 @@ def check_memory_limit(estimate, max_bytes):
         raise JobFailure(
             "메모리 상한 초과: 예상 "
             f"{needed / 1024**3:.2f}GB > 상한 {max_bytes / 1024**3:.2f}GB. "
-            "트리를 줄이거나 SOLVER_MAX_MEMORY_GB를 올려야 한다"
+            "트리를 줄이거나 SOLVER_MAX_MEMORY_GB를 올려야 한다",
+            reason="memory",
         )
     return needed
 
@@ -748,7 +761,7 @@ class Runner:
             self.report_failure(job_id, "runner stopped")
             raise
         except JobFailure as exc:
-            self.report_failure(job_id, str(exc))
+            self.report_failure(job_id, str(exc), reason=exc.reason)
             return False
         except Exception as exc:  # 예상 못 한 오류도 잡을 놓아주고 다음으로 간다
             detail = read_tail_file(work / "solve.err.log")
@@ -758,10 +771,13 @@ class Runner:
             self.report_failure(job_id, message)
             return False
 
-    def report_failure(self, job_id, message):
+    def report_failure(self, job_id, message, reason=None):
         log(f"잡 {job_id} 실패: {tail(message, 500)}")
         try:
-            self.api.fail(job_id, message)
+            if reason:
+                self.api.fail(job_id, message, reason=reason)
+            else:
+                self.api.fail(job_id, message)
         except Exception as exc:
             log(f"잡 {job_id} 실패 보고를 못 보냈다: {exc}")
 

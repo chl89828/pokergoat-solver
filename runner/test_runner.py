@@ -544,3 +544,27 @@ def test_heartbeat_survives_api_errors():
         while api.heartbeat.call_count < 1 and R.time.monotonic() < deadline:
             R.time.sleep(0.01)
     assert api.heartbeat.call_count >= 1
+
+
+def test_memory_failure_is_reported_without_retry(monkeypatch):
+    """메모리 초과는 reason=memory, retry=False로 보고해 API가 재시도하지 않게 한다."""
+    calls = []
+
+    class FakeApi:
+        runner_id = "mac"
+
+        def fail(self, job_id, error, reason=None):
+            calls.append((job_id, error, reason))
+
+    api = R.ApiClient.__new__(R.ApiClient)
+    api.runner_id = "mac"
+    api._post = lambda path, payload: calls.append((path, payload))
+    api.fail(7, "메모리 상한 초과", reason="memory")
+    path, payload = calls[-1]
+    assert path == "jobs/7/fail/"
+    assert payload["reason"] == "memory"
+    assert payload["retry"] is False
+
+    api.fail(8, "기타 오류")
+    _, payload = calls[-1]
+    assert "reason" not in payload and "retry" not in payload
