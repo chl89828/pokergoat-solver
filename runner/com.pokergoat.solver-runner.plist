@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  POKER GOAT 솔버 러너 launchd 템플릿.
+
+  install-launchd.sh가 __RUNNER_DIR__와 __PYTHON__을 현재 머신 경로로 바꿔
+  ~/Library/LaunchAgents/com.pokergoat.solver-runner.plist에 쓴다. 이 파일을
+  직접 복사해 쓰면 치환이 안 돼서 뜨지 않는다.
+
+  caffeinate -i로 감싸는 이유는 솔브가 몇십 분씩 돌기 때문이다. 유휴 슬립이
+  걸리면 잡이 하트비트를 놓치고 큐로 되돌아간다. -i는 유휴 슬립만 막으므로
+  뚜껑을 닫거나 사용자가 직접 잠재우면 그대로 잔다.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pokergoat.solver-runner</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>__PYTHON__</string>
+        <string>__RUNNER_DIR__/runner.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__RUNNER_DIR__</string>
+
+    <!-- 상시 러너다. 부팅과 로그인 직후 뜨고, 죽으면 다시 뜬다. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <!-- 설정 오류로 즉시 죽을 때 로그가 폭주하지 않게 재기동 간격을 준다. -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <!-- launchd는 최소 PATH라 python과 도구 위치를 명시한다. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__RUNNER_DIR__/logs/solver-runner.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__RUNNER_DIR__/logs/solver-runner.err.log</string>
+
+    <!-- 솔브는 CPU를 오래 쓴다. 백그라운드로 눌리면 배치가 하염없이 느려진다. -->
+    <key>ProcessType</key>
+    <string>Standard</string>
+    <key>LowPriorityIO</key>
+    <false/>
+</dict>
+</plist>

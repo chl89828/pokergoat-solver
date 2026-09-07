@@ -214,3 +214,20 @@ AA, KK+, AKs, AQo, A2s+, T9s-65s, AhKh, KQo:0.5
 ubuntu-22.04(x86_64)에서 테스트와 빌드를 하고, 토이 게임 자가 점검을 돌린 뒤
 `pokergoat-solver-{target}.tar.gz`와 sha256을 GitHub 릴리스에 올린다.
 러너는 그 릴리스에서 맥 바이너리를 내려받아 쓴다.
+
+## 러너
+
+`runner/`는 사장님 맥에서 상시 도는 로컬 배치 워커다. Django API의 잡 큐를
+폴링해 잡을 하나씩 가져오고, 위 CLI로 풀고, blob을 Cloudflare R2에 올린 뒤
+완료를 보고한다. launchd로 등록하고 Railway CLI에 의존하지 않는다.
+
+```bash
+cd runner
+./install-bin.sh                        # 릴리스에서 맥 바이너리 설치
+cp .env.example .env && chmod 600 .env  # API 토큰과 R2 키 입력
+../../.venv/bin/python runner.py --check
+./install-launchd.sh
+```
+
+설정 키, Django 쪽에 필요한 env, R2 커스텀 도메인, 문제 해결은
+[`runner/README.md`](runner/README.md)에 있다.

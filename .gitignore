@@ -3,3 +3,11 @@
 *.bin.br
 /out/
 .DS_Store
+
+# 러너 (로컬 전용 자산, 커밋 금지)
+runner/.env
+runner/bin/
+runner/work/
+runner/logs/
+__pycache__/
+.pytest_cache/
