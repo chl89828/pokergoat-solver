@@ -45,6 +45,9 @@ enum Command {
         /// brotli 압축 없이 .bin 그대로 쓴다 (디버깅용)
         #[arg(long = "no-compress")]
         no_compress: bool,
+        /// 엔진 메모리 모드: auto(8GiB 초과 시 압축) / full / compressed
+        #[arg(long = "memory", default_value = "auto")]
+        memory: String,
         /// 노드락 (자리만 있고 아직 구현하지 않았다, §4.6)
         #[arg(long)]
         lock: Option<String>,
@@ -88,12 +91,14 @@ fn run(cli: Cli) -> Result<i32> {
             threads,
             time_limit,
             no_compress,
+            memory,
             lock,
         } => {
             if lock.is_some() {
                 bail!("--lock은 아직 구현하지 않았다 (§4.6)");
             }
-            solve_job(&config, &out, threads, time_limit, !no_compress)?;
+            let memory_mode = MemoryMode::parse(&memory)?;
+            solve_job(&config, &out, threads, time_limit, !no_compress, memory_mode)?;
             Ok(0)
         }
         Command::Aggregate { scenario_dir, out } => {
@@ -172,12 +177,42 @@ fn estimate(config_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// 엔진 리그렛·전략 누적 저장 방식. compressed는 i16 + 스케일로 메모리를 절반으로 줄인다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryMode {
+    Auto,
+    Full,
+    Compressed,
+}
+
+impl MemoryMode {
+    const AUTO_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "full" => Ok(Self::Full),
+            "compressed" => Ok(Self::Compressed),
+            other => bail!("--memory 값이 잘못됐다: {other} (auto / full / compressed)"),
+        }
+    }
+
+    fn use_compressed(self, uncompressed_bytes: u64) -> bool {
+        match self {
+            Self::Auto => uncompressed_bytes > Self::AUTO_THRESHOLD_BYTES,
+            Self::Full => false,
+            Self::Compressed => true,
+        }
+    }
+}
+
 fn solve_job(
     config_path: &PathBuf,
     out_dir: &PathBuf,
     threads: Option<usize>,
     time_limit: Option<f64>,
     compress: bool,
+    memory_mode: MemoryMode,
 ) -> Result<()> {
     set_threads(threads)?;
     let config = JobConfig::from_path(config_path)?;
@@ -187,15 +222,18 @@ fn solve_job(
         eprintln!("경고: {warning}");
     }
 
-    let (uncompressed, _) = built.game.memory_usage();
+    let (uncompressed, compressed_bytes) = built.game.memory_usage();
+    let use_compressed = memory_mode.use_compressed(uncompressed);
     eprintln!(
-        "메모리 예상 {:.2}GB, 핸드 OOP {} / IP {}",
+        "메모리 예상 {:.2}GB (압축 시 {:.2}GB, 모드 {}), 핸드 OOP {} / IP {}",
         uncompressed as f64 / (1024.0 * 1024.0 * 1024.0),
+        compressed_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        if use_compressed { "compressed" } else { "full" },
         built.game.private_cards(0).len(),
         built.game.private_cards(1).len()
     );
 
-    built.game.allocate_memory(false);
+    built.game.allocate_memory(use_compressed);
     let outcome = solve::run_solver(
         &mut built.game,
         config.iterations,
