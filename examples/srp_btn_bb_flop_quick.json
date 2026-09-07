@@ -1,0 +1,62 @@
+{
+  "scenario": "c6m_100_srp_btn_bb_quick",
+  "scenarioId": 1,
+  "template": "t_quick_v1",
+  "templateId": 99,
+  "board": "As7d2c",
+  "ranges": [
+    "JJ-22,AJs-A2s,K2s+,Q5s+,J7s+,T7s+,97s+,86s+,75s+,64s+,53s+,AJo-A2o,K9o+,Q9o+,J9o+,T9o,98o",
+    "22+,A2s+,K5s+,Q7s+,J8s+,T8s+,97s+,86s+,75s+,64s+,54s,A2o+,K9o+,Q9o+,J9o+,T9o"
+  ],
+  "pot": 5.5,
+  "effectiveStack": 97.5,
+  "sizing": {
+    "flop": {
+      "oop": {
+        "bet": [
+          33
+        ]
+      },
+      "ip": {
+        "bet": [
+          33
+        ]
+      }
+    },
+    "turn": {
+      "oop": {
+        "bet": [
+          75
+        ]
+      },
+      "ip": {
+        "bet": [
+          75
+        ]
+      }
+    },
+    "river": {
+      "oop": {
+        "bet": [
+          75
+        ]
+      },
+      "ip": {
+        "bet": [
+          75
+        ]
+      }
+    }
+  },
+  "maxRaisesPerStreet": 2,
+  "allInThreshold": 0.67,
+  "addAllInThreshold": 1.5,
+  "mergingThreshold": 0.1,
+  "iterations": 200,
+  "targetExploitability": 0.3,
+  "rake": {
+    "percent": 5,
+    "capBb": 3
+  },
+  "storeRiver": false
+}

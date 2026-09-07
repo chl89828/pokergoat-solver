@@ -1,0 +1,70 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust 툴체인
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 캐시
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: 테스트
+        run: cargo test --release --target ${{ matrix.target }}
+
+      - name: 빌드
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: 토이 게임 자가 점검
+        run: ./target/${{ matrix.target }}/release/pokergoat-solver validate
+
+      - name: 패키징
+        run: |
+          set -eu
+          name="pokergoat-solver-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/pokergoat-solver" "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          cp -r examples "dist/$name/"
+          tar -C dist -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: 릴리스 업로드
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            pokergoat-solver-${{ matrix.target }}.tar.gz
+            pokergoat-solver-${{ matrix.target }}.tar.gz.sha256
+
+      - name: 아티팩트 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: pokergoat-solver-${{ matrix.target }}
+          path: pokergoat-solver-${{ matrix.target }}.tar.gz
